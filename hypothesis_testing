@@ -1,0 +1,488 @@
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from scipy import stats
+from scipy.stats import shapiro, ttest_ind, mannwhitneyu, f_oneway, kruskal
+import warnings
+
+# Загрузка данных
+PATH_OUT = r'/Users/ekaterinaborisova/Downloads/ecom_yl.csv'
+df = pd.read_csv(PATH_OUT, sep=",", encoding='utf-8', decimal=",", skipinitialspace=True)
+
+# 1. Приведение названий столбцов в соответствии с PEP8
+df.columns = df.columns.str.lower().str.replace(" ", "_").str.strip()
+for col in ['region', 'device', 'channel']:
+    if col in df.columns:
+        # Приводим к строковому типу, нижнему регистру, убираем пробелы
+        df[col] = df[col].astype(str).str.lower().str.strip()
+        # Исправляем возможные опечатки
+        df[col] = df[col].replace({
+            'mobile': 'mobile',
+            'desktop': 'desktop',
+            'tablet': 'tablet',
+            'унйтед штатес': 'united states',
+            'unjted states': 'united states',
+            'германи': 'germany',
+            'франс': 'france',
+            'франце': 'france',
+            'юк': 'uk',
+            'great britain': 'uk',
+            'united kingdom': 'uk',
+        })
+        # Приводим к нормальному виду (первые буквы заглавные)
+        df[col] = df[col].str.title()
+def fix_mixed_encoding(text):
+    if pd.isna(text):
+        return 'Unknown'
+
+    text = str(text)
+
+    # Заменяем кириллические символы, которые выглядят как латинские
+    replacements = {
+        'а': 'a', 'с': 'c', 'е': 'e', 'о': 'o', 'р': 'p',
+        'у': 'y', 'х': 'x', 'к': 'k', 'А': 'A', 'С': 'C',
+        'Е': 'E', 'О': 'O', 'Р': 'P', 'У': 'Y', 'Х': 'X',
+        'К': 'K', 'М': 'M', 'Т': 'T', 'Н': 'H', 'В': 'B'
+    }
+
+    for wrong, correct in replacements.items():
+        text = text.replace(wrong, correct)
+
+    return text.strip()
+
+
+# Применяем ко всем категориальным колонкам
+for col in ['region', 'device', 'channel']:
+    if col in df.columns:
+        df[col] = df[col].apply(fix_mixed_encoding).str.title()
+
+
+print(f"Уникальные регионы: {df['region'].unique()}")
+print(f"Уникальные устройства: {df['device'].unique()}")
+
+# 2. Проверка и обработка пропусков
+print("Количество пропусков по столбцам:")
+print(df.isnull().sum())
+
+# Преобразуем revenue в числовой формат
+df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce').fillna(0)
+
+# Преобразуем session_duration_sec в числовой формат
+df['sessiondurationsec'] = pd.to_numeric(df['sessiondurationsec'], errors='coerce')
+if df['sessiondurationsec'].isnull().any():
+    median_duration = df['sessiondurationsec'].median()
+    df['sessiondurationsec'] = df['sessiondurationsec'].fillna(median_duration)
+
+# 3. Проверка на дубликаты
+print(f"Явные дубликаты: {df.duplicated().sum()}\n")
+
+# Проверка неявных дубликатов в категориальных данных
+print("Уникальные значения в категориальных столбцах:")
+for col in ['region', 'device', 'channel', 'payment_type']:
+    if col in df.columns:
+        unique_vals = df[col].unique()
+        print(f"{col}: {len(unique_vals)} уникальных значений")
+        if df[col].dtype == 'object':
+            print(f"  Примеры: {unique_vals[:5]}")
+# 4. Преобразование типов данных для дат
+date_cols = ['session_start', 'session_end', 'session_date', 'order_dt']
+for col in date_cols:
+    if col in df.columns:
+        df[col] = pd.to_datetime(df[col], errors='coerce')
+# 5. Добавление столбца с итоговой суммой покупки с учетом промокода
+df['promo_code'] = pd.to_numeric(df['promo_code'], errors='coerce').fillna(0)
+df['final_revenue'] = df.apply(
+    lambda row: row['revenue'] * 0.9 if row['promo_code'] == 1 else row['revenue'],
+    axis=1
+)
+# 6. Определение исследуемого периода
+print(f"\nИсследуемый период:")
+print(f"Начало: {df['session_date'].min()}")
+print(f"Конец: {df['session_date'].max()}")
+
+df['year_month'] = df['session_date'].dt.to_period('M')
+monthly_stats = df.groupby('year_month').agg({
+    'user_id': 'count',
+    'final_revenue': 'sum',
+    'order_dt': lambda x: x.notnull().sum()
+}).rename(columns={'user_id': 'visits', 'order_dt': 'orders'})
+
+print("\nСтатистика по месяцам:")
+print(monthly_stats)
+# 7. Проверка на выбросы
+print("\nПроверка на выбросы:")
+numeric_cols = ['sessiondurationsec', 'revenue', 'final_revenue']
+for col in numeric_cols:
+    if col in df.columns:
+        Q1 = df[col].quantile(0.25)
+        Q3 = df[col].quantile(0.75)
+        IQR = Q3 - Q1
+        outliers = ((df[col] < (Q1 - 1.5 * IQR)) | (df[col] > (Q3 + 1.5 * IQR))).sum()
+        print(f"{col}: {outliers} выбросов ({(outliers/len(df))*100:.1f}%)")
+
+df['sessiondurationmin'] = df['sessiondurationsec'] / 60
+print(f"\nСессии длительнее 60 минут: {(df['sessiondurationmin'] > 60).sum()}")
+print(f"Сессии короче 1 секунды: {(df['sessiondurationsec'] < 1).sum()}")
+# 8. Добавление столбца с временем суток
+def get_time_of_day(hour):
+    if 6 <= hour < 10:
+        return 'утро'
+    elif 10 <= hour < 17:
+        return 'день'
+    elif 17 <= hour < 22:
+        return 'вечер'
+    else:
+        return 'ночь'
+
+df['time_of_day'] = df['hour_of_day'].apply(get_time_of_day)
+
+# 9. Добавление столбца "payer"
+df['payer'] = df['order_dt'].notnull().astype(int)
+
+print(f"\nСтатистика по платящим пользователям:")
+print(f"Всего визитов: {len(df)}")
+print(f"Платящих визитов: {df['payer'].sum()} ({(df['payer'].sum()/len(df))*100:.2f}%)")
+print(f"Всего уникальных пользователей: {df['user_id'].nunique()}")
+print(f"Уникальных платящих пользователей: {df[df['payer']==1]['user_id'].nunique()}")
+# проверка гипотез
+# 1 гипотеза. Влияет ли тип устройства на количество покупок в день по каждому региону?
+print('1 гипотеза. Влияет ли тип устройства на количество покупок в день по каждому региону?')
+daily_purchases = df.groupby(['session_date', 'region', 'device'])['payer'].sum().reset_index()
+daily_purchases = daily_purchases.rename(columns={'payer': 'purchases_per_day'})
+
+
+# Проверяем, есть ли данные
+if len(daily_purchases) == 0:
+    print("Нет данных для анализа!")
+else:
+    def test_device_effect_simple(region_data):
+        """Упрощенная проверка влияния устройства"""
+        devices = region_data['device'].unique()
+        if len(devices) < 2:
+            return None, "Недостаточно устройств"
+
+        # Сразу используем непараметрические тесты (они более устойчивы)
+        if len(devices) == 2:
+            # Два устройства - Манна-Уитни
+            device1, device2 = devices
+            data1 = region_data[region_data['device'] == device1]['purchases_per_day']
+            data2 = region_data[region_data['device'] == device2]['purchases_per_day']
+
+            # Проверяем, достаточно ли данных
+            if len(data1) < 3 or len(data2) < 3:
+                return None, "Недостаточно данных"
+
+            try:
+                u_stat, p_value = mannwhitneyu(data1, data2, alternative='two-sided')
+                test = "Манна-Уитни"
+                return p_value, test
+            except:
+                return None, "Ошибка в тесте"
+        else:
+            # Более двух устройств - Крускал-Уоллис
+            groups = []
+            for device in devices:
+                data = region_data[region_data['device'] == device]['purchases_per_day']
+                if len(data) >= 1:
+                    groups.append(data)
+
+            if len(groups) < 2:
+                return None, "Недостаточно групп"
+
+            try:
+                h_stat, p_value = kruskal(*groups)
+                test = "Крускал-Уоллис"
+                return p_value, test
+            except:
+                return None, "Ошибка в тесте"
+
+
+    # Проверяем по регионам
+    results = []
+    for region in daily_purchases['region'].unique():
+        region_data = daily_purchases[daily_purchases['region'] == region]
+        p_value, test = test_device_effect_simple(region_data)
+
+        if p_value is not None:
+            significant = p_value < 0.05
+            conclusion = "Влияет" if significant else "Не влияет"
+        else:
+            conclusion = "Недостаточно данных"
+            test = "N/A"
+
+        results.append({
+            'Регион': region,
+            'Тест': test,
+            'p-value': f"{p_value:.4f}" if p_value is not None else "N/A",
+            'Вывод': conclusion
+        })
+
+    results_df = pd.DataFrame(results)
+    print("\nРезультаты проверки гипотезы 1:")
+    print(results_df.to_string(index=False))
+
+#2 гипотеза. влияет ли тип рекламного канала на количество покупок в день по каждому региону?
+#Создаем таблицу с количеством покупок в день
+print('2 гипотеза. влияет ли тип рекламного канала на количество покупок в день по каждому региону?')
+daily_purchases = df.groupby(['session_date', 'region', 'channel'])['payer'].sum().reset_index()
+daily_purchases = daily_purchases.rename(columns={'payer': 'purchases_per_day'})
+
+# Проверяем, есть ли данные
+if len(daily_purchases) == 0:
+    print("Нет данных для анализа!")
+else:
+    def test_device_effect_simple(region_data):
+        channels = region_data['channel'].unique()
+        if len(channels) < 2:
+            return None, "Недостаточно устройств"
+
+        # Сразу используем непараметрические тесты (они более устойчивы)
+        if len(channels) == 2:
+            # Два устройства - Манна-Уитни
+            channel1, channel2 = channels
+            data1 = region_data[region_data['channel'] == channel1]['purchases_per_day']
+            data2 = region_data[region_data['channel'] == channel2]['purchases_per_day']
+
+            # Проверяем, достаточно ли данных
+            if len(data1) < 3 or len(data2) < 3:
+                return None, "Недостаточно данных"
+
+            try:
+                u_stat, p_value = mannwhitneyu(data1, data2, alternative='two-sided')
+                test = "Манна-Уитни"
+                return p_value, test
+            except:
+                return None, "Ошибка в тесте"
+        else:
+            # Более двух устройств - Крускал-Уоллис
+            groups = []
+            for channel in channels:
+                data = region_data[region_data['channel'] == channel]['purchases_per_day']
+                if len(data) >= 1:
+                    groups.append(data)
+
+            if len(groups) < 2:
+                return None, "Недостаточно групп"
+
+            try:
+                h_stat, p_value = kruskal(*groups)
+                test = "Крускал-Уоллис"
+                return p_value, test
+            except:
+                return None, "Ошибка в тесте"
+
+
+    # Проверяем по регионам
+    results = []
+    for region in daily_purchases['region'].unique():
+        region_data = daily_purchases[daily_purchases['region'] == region]
+        p_value, test = test_device_effect_simple(region_data)
+
+        if p_value is not None:
+            significant = p_value < 0.05
+            conclusion = "Влияет" if significant else "Не влияет"
+        else:
+            conclusion = "Недостаточно данных"
+            test = "N/A"
+
+        results.append({
+            'Регион': region,
+            'Тест': test,
+            'p-value': f"{p_value:.4f}" if p_value is not None else "N/A",
+            'Вывод': conclusion
+        })
+
+    results_df = pd.DataFrame(results)
+    print("\nРезультаты проверки гипотезы 2:")
+    print(results_df.to_string(index=False))
+
+# 3 гипотеза. Проверить гипотезу о том, что средний чек отличается в зависимости от региона?
+print("3 гипотеза. Проверить гипотезу о том, что средний чек отличается в зависимости от региона?")
+
+purchases = df[(df['payer'] == 1) & (df['region'].notna())]
+
+if len(purchases) > 0:
+    regions = purchases['region'].unique()
+
+    # Проверяем, что есть хотя бы 2 региона с достаточным количеством данных
+    valid_groups = []
+    valid_regions = []
+
+    for region in regions:
+        data = purchases[purchases['region'] == region]['final_revenue']
+        # Минимум 3 наблюдения в группе для теста
+        if len(data) >= 3:
+            valid_groups.append(data)
+            valid_regions.append(region)
+
+    if len(valid_groups) >= 2:
+        try:
+            h_stat, p_value = kruskal(*valid_groups)
+            print(f"p-value = {p_value:.4f}")
+
+            if p_value < 0.05:
+                print("Чек отличается по регионам")
+            else:
+                print("Чек НЕ отличается по регионам")
+
+            print("\nСредние по регионам (только с достаточными данными):")
+            for i, region in enumerate(valid_regions):
+                print(f"  {region}: {valid_groups[i].mean():.2f} (n={len(valid_groups[i])})")
+
+        except Exception as e:
+            print(f"Ошибка при выполнении теста: {e}")
+            print("\nСредние по регионам:")
+            for i, region in enumerate(valid_regions):
+                print(f"  {region}: {valid_groups[i].mean():.2f} (n={len(valid_groups[i])})")
+    else:
+        print("Недостаточно регионов с данными для теста (нужно минимум 2 региона с хотя бы 3 наблюдениями каждый)")
+        print("\nСтатистика по регионам:")
+        for region in regions:
+            data = purchases[purchases['region'] == region]['final_revenue']
+            print(f"  {region}: {data.mean():.2f} (n={len(data)})")
+
+else:
+    print("Нет данных о покупках")
+
+# 4 гипотеза. Проверить гипотезу о том, что средний чек отличается в зависимости от рекламного канала?
+print("4 гипотеза. Проверить гипотезу о том, что средний чек отличается в зависимости от рекламного канала?")
+
+purchases = df[(df['payer'] == 1) & (df['channel'].notna())]
+
+if len(purchases) > 0:
+    channels = purchases['channel'].unique()
+
+    # Проверяем, что есть хотя бы 2 канала с достаточным количеством данных
+    valid_groups = []
+    valid_channels = []
+
+    for channel in channels:
+        data = purchases[purchases['channel'] == channel]['final_revenue']
+        # Минимум 3 наблюдения в группе для теста
+        if len(data) >= 3:
+            valid_groups.append(data)
+            valid_channels.append(channel)
+
+    if len(valid_groups) >= 2:
+        try:
+            h_stat, p_value = kruskal(*valid_groups)
+            print(f"p-value = {p_value:.4f}")
+
+            if p_value < 0.05:
+                print("Чек отличается по каналам")
+            else:
+                print("Чек НЕ отличается по каналам")
+
+            print("\nСредние по каналам (только с достаточными данными):")
+            for i, channel in enumerate(valid_channels):
+                print(f"  {channel}: {valid_groups[i].mean():.2f} (n={len(valid_groups[i])})")
+
+        except Exception as e:
+            print(f"Ошибка при выполнении теста: {e}")
+            print("\nСредние по каналам:")
+            for i, channel in enumerate(valid_channels):
+                print(f"  {channel}: {valid_groups[i].mean():.2f} (n={len(valid_groups[i])})")
+    else:
+        print("Недостаточно каналов с данными для теста (нужно минимум 2 канала с хотя бы 3 наблюдениями каждый)")
+        print("\nСтатистика по каналам:")
+        for channel in channels:
+            data = purchases[purchases['channel'] == channel]['final_revenue']
+            print(f"  {channel}: {data.mean():.2f} (n={len(data)})")
+
+else:
+    print("Нет данных")
+
+# 5 гипотеза. Проверить гипотезу о том, что средний чек отличается в зависимости от времени суток?
+print("5 гипотеза. Проверить гипотезу о том, что средний чек отличается в зависимости от времени суток?")
+
+purchases = df[(df['payer'] == 1) & (df['time_of_day'].notna())]
+
+if len(purchases) > 0:
+    time_of_days = purchases['time_of_day'].unique()
+
+    # Проверяем, что есть хотя бы 2 времени суток с достаточным количеством данных
+    valid_groups = []
+    valid_times = []
+
+    for time_of_day in time_of_days:
+        data = purchases[purchases['time_of_day'] == time_of_day]['final_revenue']
+        # Минимум 3 наблюдения в группе для теста
+        if len(data) >= 3:
+            valid_groups.append(data)
+            valid_times.append(time_of_day)
+
+    if len(valid_groups) >= 2:
+        try:
+            h_stat, p_value = kruskal(*valid_groups)
+            print(f"p-value = {p_value:.4f}")
+
+            if p_value < 0.05:
+                print("Чек отличается в зависимости от времени суток")
+            else:
+                print("Чек НЕ отличается в зависимости от времени суток")
+
+            print("\nСредние чеки по времени суток (только с достаточными данными):")
+            for i, time_of_day in enumerate(valid_times):
+                print(f"  {time_of_day}: {valid_groups[i].mean():.2f} (n={len(valid_groups[i])})")
+
+        except Exception as e:
+            print(f"Ошибка при выполнении теста: {e}")
+            print("\nСредние чеки по времени суток:")
+            for i, time_of_day in enumerate(valid_times):
+                print(f"  {time_of_day}: {valid_groups[i].mean():.2f} (n={len(valid_groups[i])})")
+    else:
+        print(
+            "Недостаточно данных по времени суток для теста (нужно минимум 2 времени с хотя бы 3 наблюдениями каждое)")
+        print("\nСтатистика по времени суток:")
+        for time_of_day in time_of_days:
+            data = purchases[purchases['time_of_day'] == time_of_day]['final_revenue']
+            print(f"  {time_of_day}: {data.mean():.2f} (n={len(data)})")
+
+else:
+    print("Нет данных")
+
+# 8 гипотеза. Влияет ли тип оплаты на сумму покупки?
+print("8 гипотеза. Влияет ли тип оплаты на сумму покупки?")
+
+purchases = df[df['payer'] == 1]
+
+if len(purchases) > 0 and 'payment_type' in purchases.columns:
+    payment_types = purchases['payment_type'].dropna().unique()
+
+    # Проверяем, что есть хотя бы 2 типа оплаты с достаточным количеством данных
+    valid_groups = []
+    valid_labels = []
+
+    for pt in payment_types:
+        data = purchases[purchases['payment_type'] == pt]['final_revenue']
+        # Минимум 3 наблюдения в группе для теста
+        if len(data) >= 3:
+            valid_groups.append(data)
+            valid_labels.append(pt)
+
+    print("Средний чек по типам оплаты:")
+    for pt in payment_types:
+        data = purchases[purchases['payment_type'] == pt]['final_revenue']
+        print(f"  {pt}: {data.mean():.2f} (n={len(data)})")
+
+    if len(valid_groups) >= 2:
+        try:
+            h_stat, p_value = kruskal(*valid_groups)
+            print(f"\nТест Крускал-Уоллиса: p-value = {p_value:.4f}")
+
+            if p_value < 0.05:
+                print("Вывод: Тип оплаты ВЛИЯЕТ на сумму покупки")
+
+                # Находим тип с максимальным средним чеком
+                best_idx = np.argmax([data.mean() for data in valid_groups])
+                print(f"Лучший тип оплаты: {valid_labels[best_idx]} ({valid_groups[best_idx].mean():.2f})")
+            else:
+                print("Вывод: Тип оплаты НЕ влияет на сумму покупки")
+        except Exception as e:
+            print(f"\nОшибка при выполнении теста: {e}")
+    else:
+        print("\nНедостаточно данных для теста (нужно минимум 2 типа оплаты с хотя бы 3 наблюдениями каждый)")
+
+else:
+    print("Нет данных или отсутствует столбец 'payment_type'")
